@@ -242,9 +242,9 @@ def decode_adsb(hex_str):
 def main():
     # Determine executable name based on platform
     if os.name == "nt":
-        exe_name = "pluto_adsb.exe"
+        exe_name = "AirInterface.exe"
     else:
-        exe_name = "./pluto_adsb"
+        exe_name = "./AirInterface"
 
     print(f"Starting ADS-B decoder (C interface: {exe_name}) ...")
 
