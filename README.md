@@ -22,7 +22,7 @@
    2. For Windows: `python ADS-BTerminal.py`
 3. To test the python script run `python ADS-BTerminal.py --test`
 
-## The terminal look like this
+## The terminal output should look like 
 
 ```text
 ========================================================================================
