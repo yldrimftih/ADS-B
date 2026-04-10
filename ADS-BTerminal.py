@@ -2,15 +2,16 @@ import subprocess
 import sys
 import math
 import os
+import time
 
-# ---------- CRC-24 (kept for standalone use / validation) ----------
+# ---------- CRC-24 ----------
 CRC_POLY = 0x1FFF409
 
 def crc24(hex_str):
     """CRC-24 over raw bytes; returns remainder."""
     data = bytes.fromhex(hex_str)
     crc = 0
-    for byte in data[:-3]:  # everything except last 3 bytes (PI field)
+    for byte in data[:-3]:
         crc ^= byte << 16
         for _ in range(8):
             crc <<= 1
@@ -21,15 +22,14 @@ def crc24(hex_str):
     return crc ^ pi
 
 
-# ---------- ADS-B Character Set (6-bit index → char) ----------
+# ---------- ADS-B Character Set (6-bit index -> char) ----------
 ADSB_CHARSET = (
     " ABCDEFGHIJKLMNOPQRSTUVWXYZ                     0123456789      "
 )
-#  0 = space, 1-26 = A-Z, 48-57 = 0-9, rest unused
 
 
 # ---------- CPR Position Decoding ----------
-NZ = 15  # Number of latitude zones for ADS-B
+NZ = 15
 
 def cpr_nl(lat):
     """Number of longitude zones at a given latitude."""
@@ -44,13 +44,7 @@ def cpr_nl(lat):
 
 
 def decode_cpr_global(lat0, lon0, lat1, lon1, t):
-    """
-    Globally unambiguous CPR decode.
-    (lat0, lon0) = even frame CPR values (0..1 normalized)
-    (lat1, lon1) = odd frame CPR values  (0..1 normalized)
-    t = 0 if most recent frame is even, 1 if odd.
-    Returns (lat, lon) in degrees or None on failure.
-    """
+    """Globally unambiguous CPR decode."""
     d_lat0 = 360.0 / (4 * NZ)
     d_lat1 = 360.0 / (4 * NZ - 1)
 
@@ -64,7 +58,6 @@ def decode_cpr_global(lat0, lon0, lat1, lon1, t):
     if lat_odd >= 270.0:
         lat_odd -= 360.0
 
-    # Check zone consistency
     if cpr_nl(lat_even) != cpr_nl(lat_odd):
         return None
 
@@ -87,96 +80,47 @@ def decode_cpr_global(lat0, lon0, lat1, lon1, t):
     return lat, lon
 
 
-# ---------- State: track even/odd CPR frames per ICAO ----------
-cpr_cache = {}  # icao -> {"even": (lat, lon, tc), "odd": (lat, lon, tc), "counter": int}
+# ---------- Aircraft State Tracker ----------
+
+aircraft_db = {}
+# Key: ICAO (str)
+# Value: {
+#   "callsign": str or None,
+#   "altitude": int or None,
+#   "lat": float or None,
+#   "lon": float or None,
+#   "speed": float or None,
+#   "heading": float or None,
+#   "vr": int or None,
+#   "cpr_even": (raw_lat, raw_lon, counter) or None,
+#   "cpr_odd":  (raw_lat, raw_lon, counter) or None,
+#   "last_seen": float (time.time()),
+#   "msg_count": int,
+# }
+
 msg_counter = 0
 
 
-def decode_position(icao, me_bits, frame_counter):
-    """Decode airborne position (TC 9-18). Returns string."""
-    # Altitude
-    q_bit = int(me_bits[15])
-    if q_bit == 1:
-        n = int(me_bits[8:15] + me_bits[16:20], 2)
-        altitude = n * 25 - 1000
-    else:
-        altitude = None  # Gillham coded, rare
-
-    # CPR encoded lat/lon
-    cpr_flag = int(me_bits[21])  # 0 = even, 1 = odd
-    raw_lat = int(me_bits[22:39], 2) / 131072.0
-    raw_lon = int(me_bits[39:56], 2) / 131072.0
-
-    # Cache this frame
-    if icao not in cpr_cache:
-        cpr_cache[icao] = {"even": None, "odd": None}
-
-    key = "odd" if cpr_flag else "even"
-    cpr_cache[icao][key] = (raw_lat, raw_lon, frame_counter)
-
-    # Try global decode if we have both frames
-    pos_str = ""
-    entry = cpr_cache[icao]
-    if entry["even"] and entry["odd"]:
-        lat0, lon0, c0 = entry["even"]
-        lat1, lon1, c1 = entry["odd"]
-
-        # Use the more recent frame as reference
-        t = 0 if c0 > c1 else 1
-        result = decode_cpr_global(lat0, lon0, lat1, lon1, t)
-        if result:
-            lat, lon = result
-            pos_str = f"Lat: {lat:.5f} Lon: {lon:.5f} | "
-
-    alt_str = f"Alt: {altitude} ft" if altitude is not None else "Alt: (Gillham)"
-    return pos_str + alt_str
-
-
-def decode_velocity(me_bits):
-    """Decode airborne velocity (TC 19, subtypes 1-2 = ground speed)."""
-    subtype = int(me_bits[5:8], 2)
-
-    if subtype in (1, 2):
-        # Ground speed (normal / supersonic)
-        ew_sign = int(me_bits[13])
-        ew_vel  = int(me_bits[14:24], 2) - 1
-        ns_sign = int(me_bits[24])
-        ns_vel  = int(me_bits[25:35], 2) - 1
-
-        if subtype == 2:  # supersonic: multiply by 4
-            ew_vel *= 4
-            ns_vel *= 4
-
-        vx = -ew_vel if ew_sign else ew_vel
-        vy = -ns_vel if ns_sign else ns_vel
-
-        speed = math.sqrt(vx ** 2 + vy ** 2)
-        heading = (math.degrees(math.atan2(vx, vy)) + 360) % 360
-
-        # Vertical rate
-        vr_sign = int(me_bits[36])
-        vr_val  = (int(me_bits[37:46], 2) - 1) * 64
-        vr = -vr_val if vr_sign else vr_val
-
-        return f"GS: {speed:.0f} kt Hdg: {heading:.1f}° VR: {vr:+d} ft/min"
-
-    elif subtype in (3, 4):
-        # Airspeed (normal / supersonic)
-        hdg_avail = int(me_bits[13])
-        if hdg_avail:
-            heading = int(me_bits[14:24], 2) * 360.0 / 1024.0
-        else:
-            heading = None
-
-        as_type = "TAS" if int(me_bits[24]) else "IAS"
-        airspeed = int(me_bits[25:35], 2)
-        if subtype == 4:
-            airspeed *= 4
-
-        hdg_str = f"Hdg: {heading:.1f}°" if heading is not None else "Hdg: N/A"
-        return f"{as_type}: {airspeed} kt {hdg_str}"
-
-    return "Velocity (unknown subtype)"
+def get_aircraft(icao):
+    """Get or create aircraft entry."""
+    if icao not in aircraft_db:
+        aircraft_db[icao] = {
+            "callsign": None,
+            "altitude": None,
+            "lat": None,
+            "lon": None,
+            "speed": None,
+            "heading": None,
+            "vr": None,
+            "cpr_even": None,
+            "cpr_odd": None,
+            "last_seen": time.time(),
+            "msg_count": 0,
+        }
+    ac = aircraft_db[icao]
+    ac["last_seen"] = time.time()
+    ac["msg_count"] += 1
+    return ac
 
 
 def decode_callsign(me_bits):
@@ -189,11 +133,130 @@ def decode_callsign(me_bits):
     return callsign.strip()
 
 
+def decode_position(icao, me_bits, ac):
+    """Decode airborne position (TC 9-18). Updates aircraft state."""
+    global msg_counter
+
+    # Altitude
+    q_bit = int(me_bits[15])
+    if q_bit == 1:
+        n = int(me_bits[8:15] + me_bits[16:20], 2)
+        ac["altitude"] = n * 25 - 1000
+
+    # CPR encoded lat/lon
+    cpr_flag = int(me_bits[21])  # 0 = even, 1 = odd
+    raw_lat = int(me_bits[22:39], 2) / 131072.0
+    raw_lon = int(me_bits[39:56], 2) / 131072.0
+
+    if cpr_flag:
+        ac["cpr_odd"] = (raw_lat, raw_lon, msg_counter)
+    else:
+        ac["cpr_even"] = (raw_lat, raw_lon, msg_counter)
+
+    # Try global decode if we have both frames
+    if ac["cpr_even"] and ac["cpr_odd"]:
+        lat0, lon0, c0 = ac["cpr_even"]
+        lat1, lon1, c1 = ac["cpr_odd"]
+        t = 0 if c0 > c1 else 1
+        result = decode_cpr_global(lat0, lon0, lat1, lon1, t)
+        if result:
+            ac["lat"], ac["lon"] = result
+
+
+def decode_velocity(me_bits, ac):
+    """Decode airborne velocity (TC 19). Updates aircraft state."""
+    subtype = int(me_bits[5:8], 2)
+
+    if subtype in (1, 2):
+        ew_sign = int(me_bits[13])
+        ew_vel  = int(me_bits[14:24], 2) - 1
+        ns_sign = int(me_bits[24])
+        ns_vel  = int(me_bits[25:35], 2) - 1
+
+        if subtype == 2:
+            ew_vel *= 4
+            ns_vel *= 4
+
+        vx = -ew_vel if ew_sign else ew_vel
+        vy = -ns_vel if ns_sign else ns_vel
+
+        ac["speed"] = math.sqrt(vx ** 2 + vy ** 2)
+        ac["heading"] = (math.degrees(math.atan2(vx, vy)) + 360) % 360
+
+        # Vertical rate
+        vr_sign = int(me_bits[36])
+        vr_val  = (int(me_bits[37:46], 2) - 1) * 64
+        ac["vr"] = -vr_val if vr_sign else vr_val
+
+    elif subtype in (3, 4):
+        hdg_avail = int(me_bits[13])
+        if hdg_avail:
+            ac["heading"] = int(me_bits[14:24], 2) * 360.0 / 1024.0
+
+        airspeed = int(me_bits[25:35], 2)
+        if subtype == 4:
+            airspeed *= 4
+        ac["speed"] = float(airspeed)
+
+
+# ---------- Display ----------
+
+STALE_TIMEOUT = 60  # Remove aircraft not seen for 60 seconds
+
+def print_table():
+    """Print the aircraft table to terminal."""
+    now = time.time()
+
+    # Remove stale entries
+    stale = [k for k, v in aircraft_db.items() if now - v["last_seen"] > STALE_TIMEOUT]
+    for k in stale:
+        del aircraft_db[k]
+
+    # Sort by ICAO
+    sorted_ac = sorted(aircraft_db.items())
+
+    # Clear screen
+    if os.name == "nt":
+        os.system("cls")
+    else:
+        print("\033[2J\033[H", end="")
+
+    # Header
+    print("=" * 105)
+    print("  ADS-B RECEIVER — ADALM-PLUTO @ 1090 MHz")
+    print(f"  Tracking: {len(sorted_ac)} aircraft | {time.strftime('%H:%M:%S')}")
+    print("=" * 105)
+    print(f"  {'ICAO':<8} {'Callsign':<10} {'Speed':>7} {'Alt (ft)':>9} "
+          f"{'Lat':>10} {'Lon':>11} {'VR(ft/m)':>9} {'Hdg':>7}")
+    print("-" * 105)
+
+    if not sorted_ac:
+        print("  Waiting for aircraft...")
+    else:
+        for icao, ac in sorted_ac:
+            cs  = ac["callsign"] or "------"
+            spd = f"{ac['speed']:.0f} kt" if ac["speed"] is not None else "---"
+            alt = f"{ac['altitude']}" if ac["altitude"] is not None else "---"
+            lat = f"{ac['lat']:.5f}" if ac["lat"] is not None else "---"
+            lon = f"{ac['lon']:.5f}" if ac["lon"] is not None else "---"
+            vr  = f"{ac['vr']:+d}" if ac["vr"] is not None else "---"
+            hdg = f"{ac['heading']:.1f}" + chr(176) if ac["heading"] is not None else "---"
+
+            print(f"  {icao:<8} {cs:<10} {spd:>7} {alt:>9} "
+                  f"{lat:>10} {lon:>11} {vr:>9} {hdg:>7}")
+
+    print("-" * 105)
+    print("  Ctrl+C to quit")
+
+
 # ---------- Main Decoder ----------
 
+last_display_time = 0
+DISPLAY_INTERVAL = 0.5  # Refresh table every 0.5 seconds
+
 def decode_adsb(hex_str):
-    """Parses a validated hex frame and prints decoded info."""
-    global msg_counter
+    """Parses a validated hex frame and updates aircraft state."""
+    global msg_counter, last_display_time
     msg_counter += 1
 
     n_hex = len(hex_str)
@@ -209,7 +272,6 @@ def decode_adsb(hex_str):
 
     # DF 17/18 = Extended Squitter (112 bits)
     if df in (17, 18) and n_bits == 112:
-        # Optional: verify CRC in Python too
         if crc24(hex_str) != 0:
             return
 
@@ -217,57 +279,51 @@ def decode_adsb(hex_str):
         me_bits = bin_str[32:88]
         tc = int(me_bits[0:5], 2)
 
-        output = f"[DF{df}] ICAO: {icao} | "
+        ac = get_aircraft(icao)
 
         if 1 <= tc <= 4:
-            cs = decode_callsign(me_bits)
-            output += f"Callsign: {cs}"
-        elif 9 <= tc <= 18:
-            output += decode_position(icao, me_bits, msg_counter)
-        elif tc == 19:
-            output += decode_velocity(me_bits)
-        elif 20 <= tc <= 22:
-            output += "Surface Position"
-        else:
-            output += f"TC: {tc}"
+            ac["callsign"] = decode_callsign(me_bits)
 
-        print(output)
+        elif 9 <= tc <= 18:
+            decode_position(icao, me_bits, ac)
+
+        elif tc == 19:
+            decode_velocity(me_bits, ac)
 
     # DF 11 = All-Call Reply (short squitter, 56 bits)
     elif df == 11 and n_bits == 14:
         icao = hex_str[2:8].upper()
-        print(f"[DF11] ICAO: {icao} | All-Call Reply")
+        get_aircraft(icao)  # Register ICAO even if no data yet
+
+    # Refresh display periodically
+    now = time.time()
+    if now - last_display_time >= DISPLAY_INTERVAL:
+        print_table()
+        last_display_time = now
 
 
 def main():
-    # Determine executable name based on platform
     if os.name == "nt":
         exe_name = "AirInterface.exe"
     else:
         exe_name = "./AirInterface"
 
-    print(f"Starting ADS-B decoder (C interface: {exe_name}) ...")
-
     try:
         process = subprocess.Popen(
             [exe_name],
             stdout=subprocess.PIPE,
-            stderr=None,        # let C stderr print to terminal
+            stderr=None,
             text=True,
-            bufsize=1,          # line-buffered for real-time output
+            bufsize=1,
         )
     except FileNotFoundError:
         print(f"Error: {exe_name} not found. Compile the C code first.")
         return
 
-    print("Listening on 1090 MHz ... (Ctrl+C to quit)")
-    print("-" * 60)
-
     try:
         for line in iter(process.stdout.readline, ''):
             raw = line.strip()
 
-            # Strip *...; wrapper from C output
             if raw.startswith('*') and raw.endswith(';'):
                 raw = raw[1:-1]
 
@@ -282,57 +338,56 @@ def main():
         process.wait(timeout=3)
 
 
+def run_tests():
+    """Run test suite with tabular output."""
+    global last_display_time
+
+    print("Feeding test messages...\n")
+
+    test_msgs = [
+        "8D4840D6202CC371C32CE0576098",   # KLM1023 callsign
+        "8D40621D58C382D690C8AC2863A7",   # 40621D position even
+        "8D40621D58C386435CC412692AD6",   # 40621D position odd -> lat/lon
+        "8D485020994409940838175B284F",   # 485020 velocity
+        "8DA05F219B06B6AF189400CBC33F",   # A05F21 velocity (TAS)
+        "8DABA1A023101331C38D205B04E5",   # DAL1084 callsign
+        "8DABA1A0990C950B509C042E09F3",   # ABA1A0 velocity
+        "8DA48E3A5831D5652AB9D932A61B",   # A48E3A position
+    ]
+
+    for msg in test_msgs:
+        last_display_time = 0  
+        decode_adsb(msg)
+
+    print_table()
+
+
+def main_stdin():
+    """Read hex frames from stdin (piped mode)."""
+    try:
+        for line in sys.stdin:
+            raw = line.strip()
+
+            if raw.startswith('*') and raw.endswith(';'):
+                raw = raw[1:-1]
+
+            if not raw:
+                continue
+            if not all(c in '0123456789ABCDEFabcdef' for c in raw):
+                continue
+
+            decode_adsb(raw)
+
+        print_table()
+
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+
+
 if __name__ == "__main__":
-    main()
-    #print("=" * 60)
-    #print("ADS-B DECODER — TEST SUITE (all CRC-verified)")
-    #print("=" * 60)
- 
-    ## Test 1: Callsign — KLM1023 (mode-s.org textbook example)
-    ## ICAO: 4840D6 (Fokker 70, KLM Cityhopper)
-    #print("\n[Test 1] Callsign — expected: ICAO 4840D6, KLM1023")
-    #decode_adsb("8D4840D6202CC371C32CE0576098")
- 
-    ## Test 2: Airborne Position Even (TC=11) — altitude only (no pair yet)
-    ## ICAO: 40621D, expected: 38000 ft
-    #print("\n[Test 2] Position Even — expected: 40621D @ 38000 ft")
-    #cpr_cache.clear(); msg_counter = 10
-    #decode_adsb("8D40621D58C382D690C8AC2863A7")
- 
-    ## Test 3: Airborne Position Odd (TC=11) — CPR pair resolves lat/lon
-    ## Expected: Lat ~52.266, Lon ~3.939 (over Netherlands)
-    #print("\n[Test 3] Position Odd — expected: Lat ~52.27, Lon ~3.94")
-    #decode_adsb("8D40621D58C386435CC412692AD6")
- 
-    ## Test 4: Velocity subtype 1 (ground speed)
-    ## ICAO: 485020, expected: GS ~159 kt, Hdg ~182.9°, VR -832 ft/min
-    #print("\n[Test 4] Velocity (GS) — expected: ~159 kt, ~183°")
-    #decode_adsb("8D485020994409940838175B284F")
- 
-    ## Test 5: Velocity subtype 3 (airspeed + heading)
-    ## ICAO: A05F21, expected: TAS 376 kt, Hdg ~244°
-    #print("\n[Test 5] Velocity (TAS) — expected: TAS 376 kt, Hdg ~244°")
-    #decode_adsb("8DA05F219B06B6AF189400CBC33F")
- 
-    ## Test 6: Corrupted packet — CRC must reject (last byte 98→99)
-    #print("\n[Test 6] CRC rejection — corrupted (should be silent)")
-    #decode_adsb("8D4840D6202CC371C32CE0576099")
- 
-    ## Test 7: Real callsign from ADSBexchange raw feed
-    ## ICAO: ABA1A0, expected: DAL1084 (Delta Air Lines)
-    #print("\n[Test 7] Callsign — expected: ABA1A0, DAL1084")
-    #decode_adsb("8DABA1A023101331C38D205B04E5")
- 
-    ## Test 8: Real velocity from ADSBexchange
-    ## ICAO: ABA1A0, expected: GS ~173 kt, Hdg ~301°, VR +2432 ft/min
-    #print("\n[Test 8] Velocity — expected: ABA1A0, ~173 kt, ~301°")
-    #decode_adsb("8DABA1A0990C950B509C042E09F3")
- 
-    ## Test 9: Real position from ADSBexchange
-    ## ICAO: A48E3A, expected: altitude 8925 ft
-    #print("\n[Test 9] Position — expected: A48E3A @ 8925 ft")
-    #cpr_cache.clear(); msg_counter = 30
-    #decode_adsb("8DA48E3A5831D5652AB9D932A61B")
- 
-    #print("\n" + "=" * 60)
-    #print("Tests complete. Starting live capture...\n")
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        run_tests()
+    elif not sys.stdin.isatty():
+        main_stdin()
+    else:
+        main()
