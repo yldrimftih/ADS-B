@@ -39,3 +39,12 @@
   ABA1A0   DAL1084     173 kt       ---          ---         ---     +2432   301.0°     
 ----------------------------------------------------------------------------------------
 ```
+
+## Test the System
+
+1. You can generate custom *.bin* files using `GenerateIQTest.py`.  
+2. After that, run this command:
+   1. For linux: `python3 GenerateIQTest.py`
+   2. For Windows: `python GenerateIQTest.py`
+3. To verify if it's a valid ADS-B file: `.\TestAirInterface.exe TestADS-BIQ.bin`
+4. To test the pipelined system: `.\TestAirInterface.exe TestADS-BIQ.bin 2>$null | python ADS-BTerminal.py`
