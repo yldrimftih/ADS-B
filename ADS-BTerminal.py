@@ -99,6 +99,7 @@ aircraft_db = {}
 # }
 
 msg_counter = 0
+sampling_rate = None
 
 
 def get_aircraft(icao):
@@ -223,7 +224,8 @@ def print_table():
 
     # Header
     print("=" * 105)
-    print("  ADS-B RECEIVER — ADALM-PLUTO @ 1090 MHz")
+    sr_str = f" @ {sampling_rate}" if sampling_rate else ""
+    print(f"  ADS-B RECEIVER — ADALM-PLUTO{sr_str}")
     print(f"  Tracking: {len(sorted_ac)} aircraft | {time.strftime('%H:%M:%S')}")
     print("=" * 105)
     print(f"  {'ICAO':<8} {'Callsign':<10} {'Speed':>7} {'Alt (ft)':>9} "
@@ -324,6 +326,12 @@ def main():
         for line in iter(process.stdout.readline, ''):
             raw = line.strip()
 
+            # Capture sampling rate from C program
+            if raw.startswith('SAMPLING_RATE:'):
+                global sampling_rate
+                sampling_rate = raw
+                continue
+
             if raw.startswith('*') and raw.endswith(';'):
                 raw = raw[1:-1]
 
@@ -364,9 +372,15 @@ def run_tests():
 
 def main_stdin():
     """Read hex frames from stdin (piped mode)."""
+    global sampling_rate
     try:
         for line in sys.stdin:
             raw = line.strip()
+
+            # Capture sampling rate from C program
+            if raw.startswith('SAMPLING_RATE:'):
+                sampling_rate = raw
+                continue
 
             if raw.startswith('*') and raw.endswith(';'):
                 raw = raw[1:-1]
