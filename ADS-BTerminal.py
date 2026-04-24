@@ -314,7 +314,7 @@ def main():
         process = subprocess.Popen(
             [exe_name],
             stdout=subprocess.PIPE,
-            stderr=None,
+            stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
         )
@@ -329,7 +329,9 @@ def main():
             # Capture sampling rate from C program
             if raw.startswith('SAMPLING_RATE:'):
                 global sampling_rate
-                sampling_rate = raw
+                parts = raw.split('(')
+                if len(parts) > 1:
+                    sampling_rate = parts[1].split(')')[0].strip()  # Extract "2.5 MSPS"
                 continue
 
             if raw.startswith('*') and raw.endswith(';'):
@@ -348,9 +350,10 @@ def main():
 
 def run_tests():
     """Run test suite with tabular output."""
-    global last_display_time
+    global last_display_time, sampling_rate
 
     print("Feeding test messages...\n")
+    sampling_rate = "Test Mode"
 
     test_msgs = [
         "8D4840D6202CC371C32CE0576098",   # KLM1023 callsign
@@ -379,7 +382,9 @@ def main_stdin():
 
             # Capture sampling rate from C program
             if raw.startswith('SAMPLING_RATE:'):
-                sampling_rate = raw
+                parts = raw.split('(')
+                if len(parts) > 1:
+                    sampling_rate = parts[1].split(')')[0].strip()  # Extract "2.5 MSPS"
                 continue
 
             if raw.startswith('*') and raw.endswith(';'):

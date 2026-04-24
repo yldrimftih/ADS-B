@@ -39,28 +39,95 @@ static int valid_count = 0;
 static int buffer_count = 0;
 
 /*
- * ADS-B Preamble at 2.5 MSPS (1 sample = 0.4 us):
+ * ADS-B Preamble timing (in microseconds):
  *
- *   Pulse 1: 0.0 us  -> sample  0.0  -> check sample 0
- *   Pulse 2: 1.0 us  -> sample  2.5  -> check samples 2,3
- *   Pulse 3: 3.5 us  -> sample  8.75 -> check samples 8,9
- *   Pulse 4: 4.5 us  -> sample 11.25 -> check samples 11,12
+ *   Pulse 1: 0.0 us
+ *   Pulse 2: 1.0 us
+ *   Pulse 3: 3.5 us
+ *   Pulse 4: 4.5 us
+ *   Data starts at 8.0 us
+ *   Each data bit = 1.0 us
+ *   Total frame = 120.0 us (8.0 + 112 * 1.0)
  *
- *   Gap samples (should be LOW): 1, 4, 5, 6, 7, 10
- *
- *   Data starts at 8.0 us -> sample 20
- *   Each data bit = 1.0 us = 2.5 samples
- *
- *   Total frame: 20 + 112*2.5 = 300 samples
+ * These will be converted to samples based on actual sampling rate.
  */
 
-#define DATA_START  20
 #define ADSB_BITS   112
 #define ADSB_BYTES  14
-#define FRAME_LEN   300
+
+/* Preamble timing in microseconds */
+#define PRE_PULSE1_US   0.0
+#define PRE_PULSE2_US   1.0
+#define PRE_PULSE3_US   3.5
+#define PRE_PULSE4_US   4.5
+#define DATA_START_US   8.0
+#define BIT_DURATION_US 1.0
+
+/* Adaptive timing structure */
+typedef struct {
+    long long sampling_rate;
+    double samples_per_us;
+    int data_start_sample;
+    int frame_len_samples;
+    double samples_per_bit;
+    /* Preamble pulse positions (in samples) */
+    int pulse1_sample;
+    int pulse2_sample;
+    int pulse3_sample;
+    int pulse4_sample;
+    /* Gap sample positions for noise estimation */
+    int gap_samples[6];
+    int gap_count;
+} TimingConfig;
+
+/* Calculate adaptive timing based on sampling rate */
+static TimingConfig* calculate_timing(long long sr) {
+    TimingConfig *cfg = (TimingConfig *)malloc(sizeof(TimingConfig));
+    if (!cfg) return NULL;
+    
+    cfg->sampling_rate = sr;
+    cfg->samples_per_us = sr / 1e6;
+    
+    /* Calculate sample positions based on microsecond timings */
+    cfg->pulse1_sample = (int)(PRE_PULSE1_US * cfg->samples_per_us + 0.5);
+    cfg->pulse2_sample = (int)(PRE_PULSE2_US * cfg->samples_per_us + 0.5);
+    cfg->pulse3_sample = (int)(PRE_PULSE3_US * cfg->samples_per_us + 0.5);
+    cfg->pulse4_sample = (int)(PRE_PULSE4_US * cfg->samples_per_us + 0.5);
+    
+    cfg->data_start_sample = (int)(DATA_START_US * cfg->samples_per_us + 0.5);
+    cfg->samples_per_bit = BIT_DURATION_US * cfg->samples_per_us;
+    
+    /* Frame length: 8.0 us (preamble+gap) + 112 * 1.0 us (data) = 120.0 us */
+    cfg->frame_len_samples = (int)(120.0 * cfg->samples_per_us + 0.5);
+    
+    /* Gap sample positions for noise estimation (between pulses) */
+    /* At 2.5 MSPS gaps were at 1, 4, 5, 6, 7, 10 (in sample units) */
+    /* Translate to microsecond positions and recalculate for actual SR */
+    cfg->gap_samples[0] = (int)(0.4 * cfg->samples_per_us + 0.5);    /* 0.4 us */
+    cfg->gap_samples[1] = (int)(1.6 * cfg->samples_per_us + 0.5);    /* 1.6 us */
+    cfg->gap_samples[2] = (int)(2.0 * cfg->samples_per_us + 0.5);    /* 2.0 us */
+    cfg->gap_samples[3] = (int)(2.4 * cfg->samples_per_us + 0.5);    /* 2.4 us */
+    cfg->gap_samples[4] = (int)(2.8 * cfg->samples_per_us + 0.5);    /* 2.8 us */
+    cfg->gap_samples[5] = (int)(4.0 * cfg->samples_per_us + 0.5);    /* 4.0 us */
+    cfg->gap_count = 6;
+    
+    return cfg;
+}
 
 int main(void) {
     crc24_init();
+
+    /* Get sampling rate from environment variable, default to 2.5 MSPS */
+    const char *sr_env = getenv("ADSB_SR");
+    double target_sr_msps = sr_env ? atof(sr_env) : 2.5;
+    long long target_sr = (long long)(target_sr_msps * 1e6 + 0.5);
+    
+    if (target_sr < 2000000 || target_sr > 10000000) {
+        fprintf(stderr, "Error: ADSB_SR must be 2-10 MSPS, got %.1f MSPS\n", target_sr_msps);
+        return -1;
+    }
+
+    fprintf(stderr, "Using sampling rate: %.1f MSPS (%lld Hz)\n", target_sr_msps, target_sr);
 
     /* 1. Connect to ADALM-PLUTO */
     struct iio_context *ctx = iio_create_context_from_uri("ip:192.168.2.1");
@@ -92,8 +159,8 @@ int main(void) {
         return -1;
     }
 
-    iio_channel_attr_write_longlong(rx_cfg, "sampling_frequency", MHZ(2.5));
-    iio_channel_attr_write_longlong(rx_cfg, "rf_bandwidth", MHZ(2.5));
+    iio_channel_attr_write_longlong(rx_cfg, "sampling_frequency", target_sr);
+    iio_channel_attr_write_longlong(rx_cfg, "rf_bandwidth", target_sr);
     iio_channel_attr_write(rx_cfg, "gain_control_mode", "manual");
     iio_channel_attr_write_double(rx_cfg, "hardwaregain", 73.0);
 
@@ -106,12 +173,26 @@ int main(void) {
     fprintf(stderr, "Config: LO=%lld Hz, SR=%lld Hz, Gain=%.1f dB\n",
             actual_freq, actual_sr, actual_gain);
 
-    if (actual_sr < 2400000 || actual_sr > 2600000) {
-        fprintf(stderr, "ERROR: Expected ~2.5 MSPS, got %.3f MSPS\n", actual_sr / 1e6);
-        fprintf(stderr, "Preamble timing will be wrong. Aborting.\n");
+    /* Validate sampling rate is within supported range */
+    if (actual_sr < 2000000 || actual_sr > 10000000) {
+        fprintf(stderr, "ERROR: Sampling rate must be 2-10 MSPS, got %.3f MSPS\n", actual_sr / 1e6);
         iio_context_destroy(ctx);
         return -1;
     }
+
+    /* Calculate adaptive timing configuration */
+    TimingConfig *timing = calculate_timing(actual_sr);
+    if (!timing) {
+        fprintf(stderr, "Error: Failed to calculate timing configuration.\n");
+        iio_context_destroy(ctx);
+        return -1;
+    }
+
+    fprintf(stderr, "Timing config: %lld MSPS, samples/us=%.2f, data_start=%d, frame_len=%d, samples/bit=%.2f\n",
+            actual_sr / 1000000, timing->samples_per_us, timing->data_start_sample,
+            timing->frame_len_samples, timing->samples_per_bit);
+
+    printf("SAMPLING_RATE: %lld Hz (%.1f MSPS)\n", actual_sr, actual_sr / 1e6);
 
     /* 3. Setup RX streaming device */
     struct iio_device *rx = iio_context_find_device(ctx, "cf-ad9361-lpc");
@@ -183,26 +264,44 @@ int main(void) {
                     preamble_count, df_reject_count, crc_fail_count, valid_count);
         }
 
-        /* 5. Scan for preambles (2.5 MSPS) */
-        for (int s = 0; s <= sample_count - FRAME_LEN; s++) {
+        /* 5. Scan for preambles with adaptive timing */
+        for (int s = 0; s <= sample_count - timing->frame_len_samples; s++) {
 
             /*
-             * Noise estimate from gap samples (positions that should be LOW):
-             * Gaps at: 1, 4, 5, 6, 7, 10 (between the four preamble pulses)
+             * Noise estimate from gap samples (positions between preamble pulses)
              */
-            double noise = (mag[s + 1] + mag[s + 4] + mag[s + 5]
-                          + mag[s + 6] + mag[s + 7] + mag[s + 10]) / 6.0;
+            double noise = 0;
+            for (int g = 0; g < timing->gap_count; g++) {
+                int gap_idx = s + timing->gap_samples[g];
+                if (gap_idx < sample_count)
+                    noise += mag[gap_idx];
+            }
+            noise /= timing->gap_count;
             double thr = (noise < 1.0) ? 1.0 : noise * 2.0;
 
             /*
              * Check four preamble pulses.
-             * Since pulses land between samples at 2.5 MSPS,
-             * take the MAX of the two candidate samples for each pulse.
+             * Since pulses may land between samples, check candidate samples around each pulse position.
              */
-            double p0 = mag[s + 0];
-            double p1 = (mag[s + 2] > mag[s + 3])   ? mag[s + 2]  : mag[s + 3];
-            double p2 = (mag[s + 8] > mag[s + 9])   ? mag[s + 8]  : mag[s + 9];
-            double p3 = (mag[s + 11] > mag[s + 12]) ? mag[s + 11] : mag[s + 12];
+            double p0_pos = s + timing->pulse1_sample;
+            double p1_pos = s + timing->pulse2_sample;
+            double p2_pos = s + timing->pulse3_sample;
+            double p3_pos = s + timing->pulse4_sample;
+            
+            int p0_idx = (int)p0_pos;
+            int p1_idx = (int)p1_pos;
+            int p2_idx = (int)p2_pos;
+            int p3_idx = (int)p3_pos;
+
+            if (p0_idx >= sample_count || p1_idx + 1 >= sample_count || 
+                p2_idx + 1 >= sample_count || p3_idx + 1 >= sample_count)
+                continue;
+
+            /* Take max of two candidate samples near each pulse */
+            double p0 = mag[p0_idx];
+            double p1 = (mag[p1_idx] > mag[p1_idx + 1]) ? mag[p1_idx] : mag[p1_idx + 1];
+            double p2 = (mag[p2_idx] > mag[p2_idx + 1]) ? mag[p2_idx] : mag[p2_idx + 1];
+            double p3 = (mag[p3_idx] > mag[p3_idx + 1]) ? mag[p3_idx] : mag[p3_idx + 1];
 
             if (p0 < thr || p1 < thr || p2 < thr || p3 < thr)
                 continue;
@@ -214,33 +313,33 @@ int main(void) {
 
             preamble_count++;
 
-            /* 6. Demodulate 112 bits via PPM at 2.5 MSPS
+            /* 6. Demodulate 112 bits via PPM with adaptive timing
              *
-             * Each bit occupies 2.5 samples starting at DATA_START.
-             * Bit b starts at sample: DATA_START + floor(b * 5 / 2)
-             *
+             * Each bit has duration BIT_DURATION_US (1.0 us)
+             * Each bit occupies timing->samples_per_bit samples.
              * PPM decode: compare first half vs second half.
-             *   Even bits (b%2==0): bit starts at integer sample
-             *     first = mag[si], second = mag[si+1]
-             *   Odd bits (b%2==1): bit starts at half-sample boundary
-             *     first = max(mag[si], mag[si+1]), second = mag[si+2]
              */
             uint8_t frame[ADSB_BYTES];
             memset(frame, 0, sizeof(frame));
 
             for (int b = 0; b < ADSB_BITS; b++) {
-                int si = s + DATA_START + (b * 5) / 2;
-                double first, second;
+                double bit_start_sample = s + timing->data_start_sample + (b * timing->samples_per_bit);
+                int bit_start_idx = (int)bit_start_sample;
+                int half_point = bit_start_idx + (int)(timing->samples_per_bit / 2.0);
 
-                if (b % 2 == 0) {
-                    first  = mag[si];
-                    second = mag[si + 1];
-                } else {
-                    first  = (mag[si] > mag[si + 1]) ? mag[si] : mag[si + 1];
-                    second = mag[si + 2];
-                }
+                if (half_point + 1 >= sample_count)
+                    break;
 
-                int bit = (first > second) ? 1 : 0;
+                /* PPM: compare first half vs second half */
+                double first_half_max = 0;
+                for (int i = bit_start_idx; i < half_point && i < sample_count; i++)
+                    if (mag[i] > first_half_max) first_half_max = mag[i];
+
+                double second_half_max = 0;
+                for (int i = half_point; i < bit_start_idx + (int)timing->samples_per_bit && i < sample_count; i++)
+                    if (mag[i] > second_half_max) second_half_max = mag[i];
+
+                int bit = (first_half_max > second_half_max) ? 1 : 0;
                 frame[b / 8] = (frame[b / 8] << 1) | bit;
             }
 
@@ -280,17 +379,13 @@ int main(void) {
             printf(";\n");
             fflush(stdout);
 
-            s += FRAME_LEN - 1;
+            s += timing->frame_len_samples - 1;
         }
     }
 
+    free(timing);
     free(mag);
     iio_buffer_destroy(rxbuf);
     iio_context_destroy(ctx);
     return 0;
 }
-
-
-
-// TODO: min sampling rate 2 MSPS, max sampling rate 10MSPS. 
-// TODO: the interface must be adaptive
